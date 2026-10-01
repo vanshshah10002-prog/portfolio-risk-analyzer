@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--cov=portfolio_risk --cov-report=term-missing --cov-fail-under=80"
+
+[tool.ruff]
+line-length = 120

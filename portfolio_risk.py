@@ -1,8 +1,12 @@
 """
 Portfolio Risk Analyzer
 ========================
-Quantitative portfolio risk analysis tool calculating VaR, CVaR,
-and stress testing scenarios using multiple methodologies.
+One-day downside risk for an equity portfolio: VaR (historical, parametric,
+Monte Carlo), CVaR / Expected Shortfall, shock scenarios and drawdown.
+
+Sign convention: every risk figure (VaR, CVaR, stress loss, max drawdown) is a
+loss expressed as a positive fraction of portfolio value. A negative VaR, CVaR or
+stress figure means the scenario is a gain.
 
 Author: Vansh Shah
 Course: MSc Financial Technology, Warwick Business School
@@ -12,157 +16,161 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from scipy import stats
-from typing import Optional
+
+TRADING_DAYS = 252
+WEIGHT_TOLERANCE = 1e-6
+MIN_OBSERVATIONS = 2  # volatility and covariance need at least two daily returns
+
+
+def fetch_returns(tickers: list[str], lookback_years: int) -> pd.DataFrame:
+    """Daily simple returns of split- and dividend-adjusted closing prices from Yahoo Finance."""
+    data = yf.download(tickers, period=f"{lookback_years}y", progress=False, auto_adjust=True)
+    try:
+        prices = data["Close"]
+    except KeyError:
+        raise ValueError(f"Yahoo Finance returned no prices for: {', '.join(tickers)}") from None
+    if isinstance(prices, pd.Series):  # older yfinance returns a flat frame for a single ticker
+        prices = prices.to_frame(tickers[0])
+    failed = [str(t) for t in prices.columns[prices.isna().all()]]
+    if failed:
+        raise ValueError(f"Yahoo Finance returned no prices for: {', '.join(failed)}")
+    return prices.dropna().pct_change().dropna()  # keep only days when every ticker traded
+
+
+def _validated_weights(weights: dict[str, float]) -> dict[str, float]:
+    """Weights may be negative (short positions) but must be finite and sum to 1."""
+    if not weights:
+        raise ValueError("portfolio_weights must contain at least one ticker")
+    if not all(np.isfinite(w) for w in weights.values()):
+        raise ValueError("portfolio weights must be finite numbers")
+    total = sum(weights.values())
+    if not abs(total - 1) <= WEIGHT_TOLERANCE:
+        raise ValueError(f"portfolio weights must sum to 1, got {total:.6f}")
+    return dict(weights)
+
+
+def _check_confidence(confidence: float) -> None:
+    if not 0 < confidence < 1:
+        raise ValueError(f"confidence must be strictly between 0 and 1, got {confidence}")
 
 
 class RiskAnalyzer:
     """
-    Compute portfolio risk metrics including VaR, CVaR, and
-    Monte Carlo stress testing.
+    Compute portfolio risk metrics from daily returns.
 
     Parameters:
-        portfolio_weights (dict): {ticker: weight} mapping.
-        lookback_years (int): Historical data window in years.
+        portfolio_weights: {ticker: weight}; weights must sum to 1.
+        lookback_years: history to download when `returns` is not given.
+        returns: optional daily returns with one column per ticker
+            (skips the download, e.g. for your own data or for tests).
     """
 
-    def __init__(self, portfolio_weights: dict, lookback_years: int = 2):
-        self.weights = portfolio_weights
+    def __init__(
+        self,
+        portfolio_weights: dict[str, float],
+        lookback_years: int = 2,
+        returns: pd.DataFrame | None = None,
+    ):
+        self.weights = _validated_weights(portfolio_weights)
         self.lookback_years = lookback_years
-        self.returns: Optional[pd.DataFrame] = None
-        self._fetch_returns()
+        if returns is None:
+            returns = fetch_returns(list(self.weights), lookback_years)
+        missing = [t for t in self.weights if t not in returns.columns]
+        if missing:
+            raise ValueError(f"no return data for: {', '.join(missing)}")
+        self.returns = returns[list(self.weights)].dropna()
+        if len(self.returns) < MIN_OBSERVATIONS:
+            raise ValueError(f"need at least {MIN_OBSERVATIONS} days of overlapping return history, "
+                             f"got {len(self.returns)}")
+        self._weight_vector = np.array(list(self.weights.values()))
 
-    def _fetch_returns(self) -> None:
-        """Fetch historical returns for portfolio assets."""
-        tickers = list(self.weights.keys())
-        data = yf.download(
-            tickers,
-            period=f"{self.lookback_years}y",
-            progress=False,
-        )["Close"]
-        if isinstance(data, pd.Series):
-            data = data.to_frame(tickers[0])
-        self.returns = data.pct_change().dropna()
+    def portfolio_returns(self) -> pd.Series:
+        """Daily portfolio returns, weighting each asset by its ticker."""
+        return self.returns @ self._weight_vector
 
     # ------------------------------------------------------------------
     # Value at Risk
     # ------------------------------------------------------------------
 
-    def portfolio_returns(self) -> pd.Series:
-        """Compute weighted portfolio return series."""
-        w = np.array([self.weights[t] for t in self.returns.columns])
-        return (self.returns * w).sum(axis=1)
-
-    def calculate_var(
-        self,
-        confidence: float = 0.95,
-        method: str = "historical",
-    ) -> float:
+    def calculate_var(self, confidence: float = 0.95, method: str = "historical", seed: int | None = None) -> float:
         """
-        Calculate Value at Risk.
+        One-day Value at Risk.
 
         Parameters:
-            confidence: Confidence level (e.g. 0.95 for 95%).
+            confidence: confidence level, e.g. 0.95 for 95%.
             method: 'historical' | 'parametric' | 'monte_carlo'.
+            seed: random seed for the Monte Carlo method (ignored by the others).
 
         Returns:
-            VaR as a positive float (loss magnitude).
+            Loss at the (1 - confidence) quantile, as a positive fraction.
         """
+        _check_confidence(confidence)
+        if method == "monte_carlo":
+            return self.monte_carlo_var(confidence, seed=seed)
         port = self.portfolio_returns()
-
         if method == "historical":
-            var = np.percentile(port, (1 - confidence) * 100)
-        elif method == "parametric":
-            mu, sigma = port.mean(), port.std()
-            var = stats.norm.ppf(1 - confidence, mu, sigma)
-        elif method == "monte_carlo":
-            return self.monte_carlo_var(confidence)
-        else:
-            raise ValueError(f"Unknown method: {method}")
-
-        return abs(float(var))
+            return -float(np.percentile(port, (1 - confidence) * 100))
+        if method == "parametric":
+            return -float(stats.norm.ppf(1 - confidence, port.mean(), port.std()))
+        raise ValueError(f"Unknown method: {method}")
 
     def calculate_cvar(self, confidence: float = 0.95) -> float:
-        """
-        Calculate Conditional Value at Risk (Expected Shortfall).
-
-        Parameters:
-            confidence: Confidence level.
-
-        Returns:
-            CVaR as a positive float.
-        """
+        """Expected Shortfall: average loss on the days at or beyond the historical VaR."""
         port = self.portfolio_returns()
-        var = self.calculate_var(confidence)
-        tail = port[port <= -var]
-        if tail.empty:
-            return var  # fallback: no tail observations
-        return abs(float(tail.mean()))
+        threshold = -self.calculate_var(confidence, "historical")
+        return -float(port[port <= threshold].mean())  # never empty: the quantile is >= the minimum
 
     def monte_carlo_var(
         self,
         confidence: float = 0.95,
         simulations: int = 10_000,
+        seed: int | None = None,
     ) -> float:
-        """
-        Monte Carlo VaR using multivariate normal simulation.
-
-        Parameters:
-            confidence: Confidence level.
-            simulations: Number of Monte Carlo paths.
-
-        Returns:
-            VaR as a positive float.
-        """
-        mu = self.returns.mean().values
-        cov = self.returns.cov().values
-        w = np.array([self.weights[t] for t in self.returns.columns])
-
-        sim = np.random.multivariate_normal(mu, cov, simulations)
-        port_sim = sim @ w
-        var = np.percentile(port_sim, (1 - confidence) * 100)
-        return abs(float(var))
+        """VaR from one-day returns drawn from a multivariate normal fitted to the assets (seed for repeatability)."""
+        _check_confidence(confidence)
+        rng = np.random.default_rng(seed)
+        draws = rng.multivariate_normal(self.returns.mean().to_numpy(), self.returns.cov().to_numpy(), simulations)
+        return -float(np.percentile(draws @ self._weight_vector, (1 - confidence) * 100))
 
     # ------------------------------------------------------------------
-    # Stress Testing
+    # Shock scenarios and drawdown
     # ------------------------------------------------------------------
 
-    def stress_test(self, scenario_returns: dict) -> float:
+    def stress_test(self, scenario_returns: dict[str, float]) -> float:
         """
-        Apply a stress scenario to the portfolio.
+        Portfolio loss for a one-day shock.
 
         Parameters:
-            scenario_returns: {ticker: daily_return} for the stress day.
+            scenario_returns: {ticker: return}; holdings not listed are assumed flat,
+                tickers outside the portfolio are ignored.
 
         Returns:
-            Portfolio loss as a positive float.
+            Loss as a positive fraction (a gain comes back negative).
         """
-        loss = sum(
-            self.weights.get(t, 0) * r
-            for t, r in scenario_returns.items()
-        )
-        return abs(loss)
+        return -float(sum(weight * scenario_returns.get(t, 0.0) for t, weight in self.weights.items()))
+
+    def max_drawdown(self) -> float:
+        """Largest fall in compounded portfolio value from its running peak (starting at 1), as a positive fraction."""
+        wealth = (1 + self.portfolio_returns()).cumprod()
+        peak = wealth.cummax().clip(lower=1.0)
+        return float(1 - (wealth / peak).min())
 
     # ------------------------------------------------------------------
     # Summary Report
     # ------------------------------------------------------------------
 
-    def summary(self, confidence: float = 0.95) -> dict:
-        """
-        Generate a full risk summary.
-
-        Returns:
-            dict with VaR, CVaR, Monte Carlo VaR, portfolio stats.
-        """
+    def summary(self, confidence: float = 0.95, seed: int | None = None) -> dict:
+        """All metrics at one confidence level (seed makes the Monte Carlo figure repeatable)."""
         port = self.portfolio_returns()
         return {
             "portfolio_mean_daily": float(port.mean()),
             "portfolio_std_daily": float(port.std()),
-            "portfolio_annualised_vol": float(port.std() * np.sqrt(252)),
+            "portfolio_annualised_vol": float(port.std() * np.sqrt(TRADING_DAYS)),
             "historical_var": self.calculate_var(confidence, "historical"),
             "parametric_var": self.calculate_var(confidence, "parametric"),
-            "monte_carlo_var": self.monte_carlo_var(confidence),
+            "monte_carlo_var": self.monte_carlo_var(confidence, seed=seed),
             "cvar": self.calculate_cvar(confidence),
-            "max_drawdown": float((port.cumsum() - port.cumsum().cummax()).min()),
+            "max_drawdown": self.max_drawdown(),
             "confidence_level": confidence,
         }
 
@@ -171,32 +179,30 @@ class RiskAnalyzer:
 # CLI entry point
 # ======================================================================
 
-if __name__ == "__main__":
+def main() -> None:
+    weights = {"AAPL": 0.30, "MSFT": 0.30, "GOOGL": 0.20, "AMZN": 0.20}  # example: US tech portfolio
     print("=" * 60)
     print("  Portfolio Risk Analyzer")
     print("=" * 60)
-
-    # Example: US tech portfolio
-    weights = {"AAPL": 0.30, "MSFT": 0.30, "GOOGL": 0.20, "AMZN": 0.20}
-
     print(f"\nPortfolio: {weights}")
     print("Fetching market data...\n")
 
     analyzer = RiskAnalyzer(weights)
     report = analyzer.summary(confidence=0.95)
 
-    print(f"  Mean Daily Return:      {report['portfolio_mean_daily']:+.4%}")
-    print(f"  Daily Volatility:       {report['portfolio_std_daily']:.4%}")
-    print(f"  Annualised Volatility:  {report['portfolio_annualised_vol']:.2%}")
+    print(f"  Mean daily return:       {report['portfolio_mean_daily']:+.4%}")
+    print(f"  Daily volatility:        {report['portfolio_std_daily']:.4%}")
+    print(f"  Annualised volatility:   {report['portfolio_annualised_vol']:.2%}")
     print()
-    print(f"  Historical VaR (95%):   {report['historical_var']:.4%}")
-    print(f"  Parametric VaR (95%):   {report['parametric_var']:.4%}")
-    print(f"  Monte Carlo VaR (95%):  {report['monte_carlo_var']:.4%}")
-    print(f"  CVaR / ES (95%):        {report['cvar']:.4%}")
-    print(f"  Max Drawdown:           {report['max_drawdown']:.4%}")
+    print(f"  Historical VaR (95%):    {report['historical_var']:.4%}")
+    print(f"  Parametric VaR (95%):    {report['parametric_var']:.4%}")
+    print(f"  Monte Carlo VaR (95%):   {report['monte_carlo_var']:.4%}")
+    print(f"  CVaR / ES (95%):         {report['cvar']:.4%}")
+    print(f"  Max drawdown:            {report['max_drawdown']:.4%}")
     print()
-
-    # Stress test: simulate a -5% day for all assets
-    stress = {t: -0.05 for t in weights}
-    print(f"  Stress Test (-5% all):  {analyzer.stress_test(stress):.4%}")
+    print(f"  Stress test (-5% all):   {analyzer.stress_test({t: -0.05 for t in weights}):.4%}")
     print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
