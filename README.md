@@ -1,66 +1,45 @@
 # Portfolio Risk Analyzer
 
-A quantitative risk management tool for analyzing portfolio downside risk using Value at Risk (VaR), Conditional Value at Risk (CVaR), and Monte Carlo simulation.
+A compact Python module that measures one-day downside risk for an equity portfolio. It uses daily returns from Yahoo Finance and calculates Value at Risk (VaR) and Conditional VaR (Expected Shortfall) using three methods.
 
-## Features
+## What it calculates
 
-- **Value at Risk (VaR) Calculation:** Historical, parametric, and Monte Carlo methods
-- **Expected Shortfall (CVaR):** Tail risk quantification
-- **Stress Testing:** Historical scenario analysis (2008 crisis, COVID-19 crash)
-- **Correlation Analysis:** Portfolio diversification metrics
-- **Risk Decomposition:** Contribution of individual assets to portfolio risk
-
-## Installation
-
-```bash
-pip install numpy pandas yfinance matplotlib scipy
-```
+| Metric | Method |
+|---|---|
+| **Historical VaR** | Empirical percentile of the portfolio's daily returns |
+| **Parametric VaR** | Normal distribution fitted to the portfolio's daily mean and standard deviation |
+| **Monte Carlo VaR** | 10,000 draws of one-day returns from a multivariate normal fitted to the assets' mean and covariance |
+| **CVaR / Expected Shortfall** | Average of historical returns at or beyond the historical VaR |
+| **Shock scenario** | Size of the portfolio move for a user-supplied one-day return per ticker, such as −5% on every holding (returned as a positive number) |
+| **Summary statistics** | Mean daily return, daily and annualised volatility, maximum drawdown (approximated from cumulative simple returns) |
 
 ## Usage
+
+```bash
+pip install numpy pandas scipy yfinance
+python portfolio_risk.py
+```
 
 ```python
 from portfolio_risk import RiskAnalyzer
 
-# Define portfolio
-weights = {'AAPL': 0.3, 'MSFT': 0.3, 'GOOGL': 0.2, 'AMZN': 0.2}
-
-# Calculate risk metrics
-analyzer = RiskAnalyzer(weights)
-var_95 = analyzer.calculate_var(confidence=0.95)
-cvar_95 = analyzer.calculate_cvar(confidence=0.95)
+analyzer = RiskAnalyzer({"AAPL": 0.3, "MSFT": 0.3, "GOOGL": 0.2, "AMZN": 0.2}, lookback_years=2)
+analyzer.calculate_var(confidence=0.95, method="historical")   # or "parametric" / "monte_carlo"
+analyzer.calculate_cvar(confidence=0.95)
+analyzer.stress_test({"AAPL": -0.05, "MSFT": -0.05, "GOOGL": -0.05, "AMZN": -0.05})
+analyzer.summary()
 ```
 
-## Methodologies
+## Limitations
 
-### 1. Historical VaR
-Uses empirical return distribution from historical data
+- All measures are one-day horizon figures on simple returns. Weights must sum to 1.
+- Parametric and Monte Carlo VaR assume normally distributed returns, so they understate fat-tailed losses.
+- The shock scenario is user-specified. No historical crisis scenarios are built in.
 
-### 2. Parametric VaR
-Assumes normal distribution of returns
+## Licence
 
-### 3. Monte Carlo VaR
-Simulates 10,000+ future price paths using multivariate GBM
-
-### 4. Stress Testing
-Applies historical crisis scenarios to current portfolio
-
-## Tech Stack
-
-- **NumPy** — numerical computations
-- **pandas** — data handling
-- **SciPy** — statistical distributions
-- **yfinance** — market data
-- **matplotlib** — visualization
-
-## Key Concepts
-
-| Concept | Description |
-|---|---|
-| **Value at Risk (VaR)** | Maximum expected loss at given confidence level |
-| **Conditional VaR (CVaR)** | Expected loss beyond VaR threshold |
-| **Monte Carlo Simulation** | Stochastic modeling of asset returns |
-| **Stress Testing** | Scenario-based risk assessment |
+[MIT](LICENSE)
 
 ---
 
-*Practical implementation of risk management concepts from MSc Financial Technology curriculum at Warwick Business School.*
+*A practical implementation of risk management concepts from the MSc Financial Technology at Warwick Business School.*
